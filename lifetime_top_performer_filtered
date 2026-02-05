@@ -1,0 +1,167 @@
+import requests
+import time
+import os
+from datetime import datetime, timedelta
+
+# --- CONFIGURATION ---
+API_KEY = "6e7d4874d1af75c52046dd2211eda7bb"
+WEI_IN_ETH = 10**18
+DEFAULT_MECH_FEE_WEI = 10000000000000000
+DAYS_TO_SCAN = 30 
+WHITELIST_FILE = "trader_agent_ids.txt"
+
+# ENDPOINTS
+SUBGRAPH_TRADES = f"https://gateway.thegraph.com/api/{API_KEY}/subgraphs/id/9fUVQpFwzpdWS9bq5WkAnmKbNNcoBwatMR4yZq81pbbz"
+SUBGRAPH_MECH = "https://subgraph.autonolas.tech/subgraphs/name/mech"
+
+def load_whitelist():
+    """Loads approved agent addresses from a text file."""
+    if not os.path.exists(WHITELIST_FILE):
+        print(f"⚠️ Warning: '{WHITELIST_FILE}' not found. No filtering applied.")
+        return None
+    with open(WHITELIST_FILE, 'r') as f:
+        return set(line.strip().lower() for line in f if line.strip())
+
+def run_query(url, query, variables=None):
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json={'query': query, 'variables': variables})
+            if response.status_code == 200: return response.json()
+            time.sleep(0.5)
+        except Exception: time.sleep(1)
+    return None
+
+def fetch_active_traders():
+    print(f"🔎 Discovery Phase: Finding agents active in last {DAYS_TO_SCAN} days...")
+    cutoff_ts = int((datetime.now() - timedelta(days=DAYS_TO_SCAN)).timestamp())
+    active_agents = set()
+    last_timestamp = int(datetime.now().timestamp())
+    while True:
+        query = """query Discovery($maxTime: BigInt!) {
+            fpmmTrades(where: { creationTimestamp_lt: $maxTime }, first: 1000, orderBy: creationTimestamp, orderDirection: desc) {
+                creationTimestamp, creator { id }
+            }
+        }"""
+        data = run_query(SUBGRAPH_TRADES, query, {"maxTime": str(last_timestamp)})
+        if not data or "data" not in data: break
+        trades = data["data"].get("fpmmTrades", [])
+        if not trades: break
+        oldest = 0
+        for t in trades:
+            ts = int(t["creationTimestamp"])
+            oldest = ts
+            if ts >= cutoff_ts and t.get("creator"): active_agents.add(t["creator"]["id"].lower())
+        if oldest < cutoff_ts: break
+        last_timestamp = oldest
+        if len(trades) < 1000: break
+
+    # --- FILTER LOGIC ---
+    whitelist = load_whitelist()
+    if whitelist:
+        initial_count = len(active_agents)
+        active_agents = {a for a in active_agents if a in whitelist}
+        print(f"🧹 Filter Applied: {initial_count} active addresses -> {len(active_agents)} verified Olas agents.")
+
+    print(f"Total Active Traders Found: {len(active_agents)}\n")
+    return list(active_agents)
+
+def calculate_lifetime_roi(address):
+    stats = {"invested": 0.0, "returned": 0.0, "sells": 0}
+    market_positions = {}
+    market_answers = {}
+    market_titles = set()
+    
+    last_timestamp = int(datetime.now().timestamp())
+    
+    while True:
+        query = """query GetFullHistory($user: String!, $maxTime: BigInt!) {
+            fpmmTrades(where: { creator: $user, creationTimestamp_lt: $maxTime }, first: 1000, orderBy: creationTimestamp, orderDirection: desc) {
+                creationTimestamp, type, collateralAmount, feeAmount, outcomeTokensTraded, outcomeIndex, fpmm { id, currentAnswer, question { title } }
+            }
+        }"""
+        data = run_query(SUBGRAPH_TRADES, query, {"user": address, "maxTime": str(last_timestamp)})
+        if not data or "data" not in data: break
+        trades = data["data"].get("fpmmTrades", [])
+        if not trades: break
+        
+        for t in trades:
+            market = t.get("fpmm")
+            if not market or market.get("currentAnswer") is None: continue
+            
+            mid = market["id"]
+            market_answers[mid] = market["currentAnswer"]
+            if market.get("question") and market["question"].get("title"):
+                market_titles.add(market["question"]["title"])
+            
+            amount = float(t["collateralAmount"]) / WEI_IN_ETH
+            fees = float(t["feeAmount"]) / WEI_IN_ETH
+            tokens = float(t["outcomeTokensTraded"]) / WEI_IN_ETH
+            oid = t["outcomeIndex"]
+            
+            if mid not in market_positions: market_positions[mid] = {}
+            if oid not in market_positions[mid]: market_positions[mid][oid] = 0.0
+            
+            if t["type"] == "Buy":
+                stats["invested"] += (amount + fees)
+                market_positions[mid][oid] += tokens
+            elif t["type"] == "Sell":
+                stats["returned"] += amount
+                stats["sells"] += 1
+                market_positions[mid][oid] -= tokens
+        
+        last_timestamp = trades[-1]["creationTimestamp"]
+        if len(trades) == 0: break 
+
+    # Hex Fix applied here
+    wins = 0
+    losses = 0
+    for mid, positions in market_positions.items():
+        answer_raw = market_answers.get(mid)
+        try:
+            winning_index = int(answer_raw, 16)
+        except: winning_index = -1
+
+        for oid, tokens in positions.items():
+            if tokens < 0.001: continue
+            if winning_index == int(oid):
+                stats["returned"] += tokens
+                wins += 1
+            else:
+                losses += 1
+
+    mech_cost = 0.0
+    query_mech = """query GetMech($user: String!) { requests(where: { sender: $user }, first: 1000) { fee, questionTitle } }"""
+    mech_data = run_query(SUBGRAPH_MECH, query_mech, {"user": address})
+    if mech_data and "data" in mech_data:
+        for r in mech_data["data"]["requests"]:
+            if r.get("questionTitle") in market_titles:
+                fee = int(r["fee"]) if r.get("fee") else DEFAULT_MECH_FEE_WEI
+                mech_cost += (fee / WEI_IN_ETH)
+
+    total_cost = stats["invested"] + mech_cost
+    if total_cost < 1.0: return None
+    net_profit = stats["returned"] - total_cost
+    roi = (net_profit / total_cost) * 100
+    
+    return {"address": address, "profit": net_profit, "roi": roi, "cost": total_cost, "w": wins, "l": losses, "e": stats["sells"]}
+
+def main():
+    agents = fetch_active_traders()
+    if not agents: return
+    leaderboard = []
+    print(f"📊 Analyzing LIFETIME Performance for {len(agents)} agents...")
+    for i, a in enumerate(agents):
+        print(f"\rProcessing {i+1}/{len(agents)}", end="", flush=True)
+        res = calculate_lifetime_roi(a)
+        if res: leaderboard.append(res)
+    
+    print("\n" + "=" * 110)
+    print(f"{'AGENT ADDRESS':<42} | {'PROFIT ($)':<12} | {'ROI %':<10} | {'W / L / E':<12} | {'COST':<10}")
+    print("-" * 110)
+    leaderboard.sort(key=lambda x: x["profit"], reverse=True)
+    for e in leaderboard[:25]:
+        wle = f"{e['w']}/{e['l']}/{e['e']}"
+        print(f"{e['address']:<42} | ${e['profit']:<11.2f} | {e['roi']:>6.2f}%   | {wle:<12} | ${e['cost']:<9.2f}")
+
+if __name__ == "__main__":
+    main()
